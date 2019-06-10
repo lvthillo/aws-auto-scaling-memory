@@ -1,0 +1,237 @@
+Parameters:
+  SSHKey:
+    Type: String
+    Default: demo-key
+
+Mappings:
+  RegionMap:
+    eu-west-1:
+      HVM64: ami-030dbca661d402413
+    eu-west-2:
+      HVM64: ami-0009a33f033d8b7b6
+    eu-west-3:
+      HVM64: ami-0ebb3a801d5fb8b9b
+    eu-central-1:
+      HVM64: ami-0ebe657bc328d4e82
+    us-west-2:
+      HVM64: ami-05348ee4dc634ca1c
+    us-west-1:
+      HVM64: ami-015954d5e5548d13b
+    us-east-2:
+      HVM64: ami-0cb72367e98845d43
+    us-east-1:
+      HVM64: ami-0c6b1d09930fac512
+    ap-south-1:
+      HVM64: ami-00e782930f1c3dbc7
+    ap-northeast-2:
+      HVM64: ami-08ab3f7e72215fe91
+    ap-northeast-1:
+      HVM64: ami-00d101850e971728d
+    ap-southeast-2:
+      HVM64: ami-0fb7513bcdc525c3b
+    ap-southeast-1:
+      HVM64: ami-0b5a47f8865280111
+    ca-central-1:
+      HVM64: ami-08a9b721ecc5b0a53
+    sa-east-1:
+      HVM64: ami-058141e091292ecf0
+
+Resources:
+  ASGLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !FindInMap
+        - RegionMap
+        - !Ref 'AWS::Region'
+        - HVM64
+      InstanceType: t2.micro
+      KeyName: !Ref SSHKey
+      LaunchConfigurationName: ASGLaunchConfiguration
+      IamInstanceProfile: !Ref ASGInstanceProfile
+      SecurityGroups:
+        - !Ref ASGSG
+      UserData:
+        # This script below installs AmazonCloudWatchAgent
+        # This script will only run during initial instance launch/setup.
+        # This script will trigger configsets of default
+        # After the execution of the default ConfigSets the cfn-signal will be returned
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          rpm -Uvh https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource ASGLaunchConfiguration --region ${AWS::Region} --configsets default
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource ASGLaunchConfiguration --region ${AWS::Region}
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          # These scripts will run during the instance launch triggered by the userData
+          default:
+            - 01_setupCfnHup
+            - 02_config-amazon-cloudwatch-agent
+            - 03_restart_amazon-cloudwatch-agent
+          # These scripts will run during an update of the instance metadata = stack update.
+          UpdateEnvironment:
+            - 02_config-amazon-cloudwatch-agent
+            - 03_restart_amazon-cloudwatch-agent
+        # Definition of json configuration of AmazonCloudWatchAgent
+        02_config-amazon-cloudwatch-agent:
+          files:
+            '/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json':
+              content: !Sub |
+                {
+                  "metrics": {
+                    "append_dimensions": {
+                      "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+                      "ImageId": "${!aws:ImageId}",
+                      "InstanceId": "${!aws:InstanceId}",
+                      "InstanceType": "${!aws:InstanceType}"
+                    },
+                    "aggregation_dimensions" : [["AutoScalingGroupName"]],
+                    "metrics_collected": {
+                      "mem": {
+                        "measurement": [
+                          "mem_used_percent"
+                        ]
+                      }
+                    }
+                  }
+                }
+        # Invoke amazon-cloudwatch-agent-ctl to restart the AmazonCloudWatchAgent.
+        03_restart_amazon-cloudwatch-agent:
+          commands:
+            01_stop_service:
+              command: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a stop
+            02_start_service:
+              command: /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+        # Cfn-hup setting, it is to monitor the change of metadata.
+        # When there is change in the contents of json file in the metadata section, cfn-hup will call cfn-init to restart the AmazonCloudWatchAgent.
+        01_setupCfnHup:
+          files:
+            '/etc/cfn/cfn-hup.conf':
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: '000400'
+              owner: root
+              group: root
+            '/etc/cfn/hooks.d/amazon-cloudwatch-agent-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.ASGLaunchConfiguration.Metadata.AWS::CloudFormation::Init.02_config-amazon-cloudwatch-agent
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource ASGLaunchConfiguration --region ${AWS::Region} --configsets UpdateEnvironment
+                runas=root
+              mode: '000400'
+              owner: root
+              group: root
+            '/lib/systemd/system/cfn-hup.service':
+              content: |
+                [Unit]
+                Description=cfn-hup daemon
+                [Service]
+                Type=simple
+                ExecStart=/opt/aws/bin/cfn-hup
+                Restart=always
+                [Install]
+                WantedBy=multi-user.target
+          commands:
+            01enable_cfn_hup:
+              command: |
+                systemctl enable cfn-hup.service
+            02start_cfn_hup:
+              command: |
+                systemctl start cfn-hup.service
+
+  ASGInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: AGInstanceProfile
+      Roles:
+        - !Ref ASGRole
+
+  ASGRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: '/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentAdminPolicy
+      RoleName: ASGRole
+
+  ASGSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Bastion Host to allow SSH
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  ASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AvailabilityZones: !GetAZs ''
+      AutoScalingGroupName: auto-scaling-group
+      LaunchConfigurationName: !Ref ASGLaunchConfiguration
+      MaxSize: '5'
+      MinSize: '1'
+
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref ASG
+      Cooldown: '1'
+      ScalingAdjustment: 1
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AdjustmentType: ChangeInCapacity
+      AutoScalingGroupName: !Ref ASG
+      Cooldown: '1'
+      ScalingAdjustment: -1
+
+  MemoryAlarmHigh:
+   Type: AWS::CloudWatch::Alarm
+   Properties:
+     EvaluationPeriods: 1
+     Statistic: Average
+     Threshold: 70
+     AlarmDescription: Go in Alarm is memory is higher than 70% for 60 seconds
+     Period: 60
+     AlarmActions:
+     - Ref: ScaleUpPolicy
+     Namespace: CWAgent
+     Dimensions:
+     - Name: AutoScalingGroupName
+       Value: !Ref ASG
+     ComparisonOperator: GreaterThanThreshold
+     MetricName: mem_used_percent
+
+  MemoryAlarmLow:
+   Type: AWS::CloudWatch::Alarm
+   Properties:
+     EvaluationPeriods: 1
+     Statistic: Average
+     Threshold: 30
+     AlarmDescription: Go in Alarm is memory is lower than 30% for 60 seconds
+     Period: 60
+     AlarmActions:
+     - Ref: ScaleDownPolicy
+     Namespace: CWAgent
+     Dimensions:
+     - Name: AutoScalingGroupName
+       Value: !Ref ASG
+     ComparisonOperator: LessThanOrEqualToThreshold
+     MetricName: mem_used_percent
